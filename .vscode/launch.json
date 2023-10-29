@@ -5,12 +5,21 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: Current File",
+            "name": "(efm)cotrain",
             "type": "python",
+            "module": "torch.distributed.launch",
             "request": "launch",
-            "program": "${file}",
             "console": "integratedTerminal",
-            "justMyCode": true
+            "args": [
+                "--nproc_per_node=1",
+                "--master_port=50000",
+                "--use_env",
+                "./336_p84_4.py",
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+            },
+            "justMyCode": false,
         }
     ]
 }

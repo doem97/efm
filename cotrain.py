@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Subset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
+from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 import numpy as np
 import time
@@ -13,7 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim import lr_scheduler
-import wandb
+
+# import wandb
 
 
 def load_model(
@@ -34,6 +36,31 @@ def sinkhorn(A, n_iter=4):
         A = A / A.sum(dim=1, keepdim=True)
         A = A / A.sum(dim=2, keepdim=True)
     return A
+
+
+class CombinedDataset(Dataset):
+    def __init__(self, imagenet_dataset, my_dataset, N):
+        self.imagenet_dataset = imagenet_dataset
+        self.my_dataset = my_dataset
+        self.N = N
+
+    def __len__(self):
+        return min(len(self.imagenet_dataset), len(self.my_dataset))
+
+    def __getitem__(self, idx):
+        imagenet_image, _ = self.imagenet_dataset[idx]
+        my_image, my_label = self.my_dataset[idx]
+
+        imagenet_image, perms = permuteNxN(imagenet_image, self.N)
+        y_in = perm2vecmatNxN(perms, self.N)
+
+        return {
+            "imagenet_image": imagenet_image,
+            "y_in": y_in,
+            "perms": perms,
+            "my_image": my_image,
+            "my_label": my_label,
+        }
 
 
 class SimpleConvNet16(nn.Module):
@@ -108,14 +135,21 @@ class JigsawNet(nn.Module):
 
     def __init__(self, sinkhorn_iter=0):
         super().__init__()
+        self.num_classes = 50
         self.conv_net = SimpleConvNet56()
         # 768-dimensional embedding for each of the 36 patches
         self.fc1 = nn.Linear(768 * 36, 1024)
         self.fc1_bn = nn.BatchNorm1d(1024)
         self.fc2 = nn.Linear(1024, 36 * 36)  # 36 x 36 assignment matrix
         self.sinkhorn_iter = sinkhorn_iter
+        self.classifier = nn.Sequential(
+            nn.Linear(27648, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(1024, 50),
+        )
 
-    def forward(self, x):
+    def embed(self, x):
         bs, c, h, w = x.size()
         patch_size = 56
         patches = x.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
@@ -131,49 +165,108 @@ class JigsawNet(nn.Module):
         embeddings = (
             embeddings.view(6, 6, bs, -1).permute(2, 0, 1, 3).contiguous().view(bs, -1)
         )
+        return embeddings
 
-        # Dense layers
-        x = F.dropout(embeddings, p=0.1, training=self.training)
-        x = F.relu(self.fc1_bn(self.fc1(x)))
-        x = torch.sigmoid(self.fc2(x))
+    def forward(self, x1, x2):
+        # x1 is imneet images
+        # x2 is my images
+        bs, c, h, w = x1.size()
+        embeddings1 = self.embed(x1)
+        embeddings2 = self.embed(x2)
+
+        # Permutation prediction
+        x1 = F.dropout(embeddings1, p=0.1, training=self.training)
+        x1 = F.relu(self.fc1_bn(self.fc1(x1)))
+        x1 = torch.sigmoid(self.fc2(x1))
 
         if self.sinkhorn_iter > 0:
-            x = x.view(bs, 36, 36)
-            x = sinkhorn(x, self.sinkhorn_iter)
-            x = x.view(bs, -1)
+            x1 = x1.view(bs, 36, 36)
+            x1 = sinkhorn(x1, self.sinkhorn_iter)
+            x1 = x1.view(bs, -1)
 
-        return x
+        # Classification
+        x2 = self.classifier(embeddings2)
+        return x1, x2
 
 
-def permuteNxN(images, n):
+# def permuteNxN(image, n):
+#     """
+#     Splits the image into n x n patches and randomly permutes the patches.
+#     Assumes image is a single image tensor of shape [channels, height, width].
+#     """
+#     assert (
+#         image.size(1) % n == 0 and image.size(2) % n == 0
+#     ), "Image dimensions must be divisible by n"
+#     patch_size = image.size(1) // n
+
+#     p_image = torch.FloatTensor(image.size())
+#     perm = torch.randperm(n * n)
+#     for j in range(n * n):
+#         sr, sc = divmod(j, n)
+#         tr, tc = divmod(perm[j].item(), n)
+#         p_image[
+#             :,
+#             tr * patch_size : (tr + 1) * patch_size,
+#             tc * patch_size : (tc + 1) * patch_size,
+#         ] = image[
+#             :,
+#             sr * patch_size : (sr + 1) * patch_size,
+#             sc * patch_size : (sc + 1) * patch_size,
+#         ]
+#     return p_image, perm
+
+
+def permuteNxN(image, n, num_pairs=4):
     """
-    Splits the images into n x n patches and randomly permutes the patches.
+    Splits the image into n x n patches and randomly permutes the specified number of patch pairs.
+    Assumes image is a single image tensor of shape [channels, height, width].
+
+    :param image: Input image tensor of shape [channels, height, width].
+    :param n: The image will be divided into n x n patches.
+    :param num_pairs: Number of patch pairs to be permuted. If None, all patches are permuted.
+    :return: A tuple of (permuted_image, permutation_indices).
     """
     assert (
-        images.size(2) % n == 0 and images.size(3) % n == 0
+        image.size(1) % n == 0 and image.size(2) % n == 0
     ), "Image dimensions must be divisible by n"
-    patch_size = images.size(2) // n
+    patch_size = image.size(1) // n
 
-    p_images = torch.FloatTensor(images.size())
-    perms = torch.LongTensor(images.size(0), n * n)
-    for i in range(images.size(0)):
-        p = torch.randperm(n * n)
-        for j in range(n * n):
-            sr, sc = divmod(j, n)
-            tr, tc = divmod(p[j].item(), n)
-            p_images[
-                i,
-                :,
-                tr * patch_size : (tr + 1) * patch_size,
-                tc * patch_size : (tc + 1) * patch_size,
-            ] = images[
-                i,
-                :,
-                sr * patch_size : (sr + 1) * patch_size,
-                sc * patch_size : (sc + 1) * patch_size,
-            ]
-        perms[i, :] = p
-    return (p_images, perms)
+    p_image = torch.FloatTensor(image.size())
+    total_patches = n * n
+    perm = torch.arange(total_patches)
+    _perm = torch.arange(total_patches)
+
+    if num_pairs is not None:
+        assert (
+            0 <= num_pairs <= total_patches // 2
+        ), "num_pairs must be between 0 and total_patches // 2"
+        selected_indices = torch.randperm(total_patches)[: 2 * num_pairs]
+        for i in range(0, len(selected_indices), 2):
+            idx1, idx2 = selected_indices[i], selected_indices[i + 1]
+            perm[idx1], perm[idx2] = perm[idx2], _perm[idx1]
+
+    for j in range(total_patches):
+        sr, sc = divmod(j, n)
+        tr, tc = divmod(perm[j].item(), n)
+        p_image[
+            :,
+            tr * patch_size : (tr + 1) * patch_size,
+            tc * patch_size : (tc + 1) * patch_size,
+        ] = image[
+            :,
+            sr * patch_size : (sr + 1) * patch_size,
+            sc * patch_size : (sc + 1) * patch_size,
+        ]
+
+    return p_image, perm
+
+
+# # Example usage:
+# image = torch.rand(3, 128, 128)  # [channels, height, width]
+# n = 4  # Split into 4x4 patches
+# num_pairs = 2  # Permute 2 pairs of patches
+# p_image, perm = permuteNxN(image, n, num_pairs)
+# print("Permuted Indices:", perm)
 
 
 def restoreNxN(p_images, perms, n):
@@ -204,16 +297,15 @@ def restoreNxN(p_images, perms, n):
     return images
 
 
-def perm2vecmatNxN(perms, n):
+def perm2vecmatNxN(perm, n):
     """
-    Converts permutation vectors to vectorized assignment matrices.
+    Converts a permutation vector to a vectorized assignment matrix.
+    Assumes perm is a single permutation vector of length n*n.
     """
-    n_samples = perms.size(0)
-    mat = torch.zeros(n_samples, n * n, n * n)
-    for i in range(n_samples):
-        for k in range(n * n):
-            mat[i, k, perms[i, k]] = 1.0
-    return mat.view(n_samples, -1)
+    mat = torch.zeros(n * n, n * n)
+    for k in range(n * n):
+        mat[k, perm[k]] = 1.0
+    return mat.view(-1)
 
 
 def vecmat2permNxN(x, n):
@@ -253,9 +345,18 @@ def compute_acc(p_pred, p_true, N, average=True):
         return n
 
 
+def format_time(seconds):
+    """Formats time from seconds to hh:mm:ss"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def train_model(
     model: nn.Module,
-    criterion: nn.Module,
+    perm_criterion: nn.Module,
+    my_criterion: nn.Module,
     optimizer: optim.Optimizer,
     train_loader: DataLoader,
     validation_loader: DataLoader,
@@ -266,14 +367,15 @@ def train_model(
     scheduler: lr_scheduler._LRScheduler = None,
 ) -> dict:
     model.to(device)
-    history = {"loss": [], "val_loss": [], "acc": [], "val_acc": []}
+    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
     torch.autograd.set_detect_anomaly(True)
 
     for epoch in range(n_epochs):
         avg_loss, acc, n_samples = run_epoch(
             model,
             train_loader,
-            criterion,
+            perm_criterion,
+            my_criterion,
             optimizer,
             device,
             N,
@@ -283,7 +385,7 @@ def train_model(
         )
         if scheduler is not None:
             scheduler.step()
-        history["train_loss"].append(acc)
+        history["train_loss"].append(avg_loss)
         history["train_acc"].append(acc)
 
         # Clear GPU memory cache
@@ -291,7 +393,14 @@ def train_model(
             torch.cuda.empty_cache()
 
         avg_loss, acc, n_samples = run_epoch(
-            model, validation_loader, criterion, optimizer, device, N, is_train=False
+            model,
+            validation_loader,
+            perm_criterion,
+            my_criterion,
+            optimizer,
+            device,
+            N,
+            is_train=False,
         )
         history["val_loss"].append(avg_loss)
         history["val_acc"].append(acc)
@@ -304,41 +413,27 @@ def train_model(
                 f"acc={history['train_acc'][-1]:.2%}, "
                 f"val_acc={history['val_acc'][-1]:.2%}"
             )
-            wandb.log(
+        if checkpoint_name is not None and torch.distributed.get_rank() == 0:
+            torch.save(
                 {
-                    "val_loss": history["val_loss"][-1],
-                    "val_acc": history["val_acc"][-1],
-                }
+                    "history": history,
+                    "model": model.module.state_dict(),  # Save the original model's state dict
+                    "optimizer": optimizer.state_dict(),
+                },
+                f"{checkpoint_name}.epoch",
             )
 
     if dist.get_rank() == 0:
         print("Training completed")
 
-    if checkpoint_name is not None and torch.distributed.get_rank() == 0:
-        torch.save(
-            {
-                "history": history,
-                "model": model.module.state_dict(),  # Save the original model's state dict
-                "optimizer": optimizer.state_dict(),
-            },
-            checkpoint_name,
-        )
-
     return history
-
-
-def format_time(seconds):
-    """Formats time from seconds to hh:mm:ss"""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def run_epoch(
     model: nn.Module,
     data_loader: DataLoader,
-    criterion: nn.Module,
+    imagenet_criterion: nn.Module,
+    my_data_criterion: nn.Module,
     optimizer: optim.Optimizer,
     device: torch.device,
     N: int,
@@ -359,25 +454,39 @@ def run_epoch(
     n_samples = 0
     start_time = time.time()
 
-    for i, (inputs, _) in enumerate(data_loader, start=1):
-        inputs, perms = permuteNxN(inputs, N)
-        y_in = perm2vecmatNxN(perms, N)
-        inputs, y_in, perms = inputs.to(device), y_in.to(device), perms.to(device)
+    for i, data in enumerate(data_loader, start=1):
+        imagenet_images, y_in, my_images, my_labels = (
+            data["imagenet_image"],
+            data["y_in"],
+            data["my_image"],
+            data["my_label"],
+        )
+        imagenet_images, y_in, my_images, my_labels = (
+            imagenet_images.to(device),
+            y_in.to(device),
+            my_images.to(device),
+            my_labels.to(device),
+        )
+        batch_size = imagenet_images.size(0)
 
         if is_train:
             optimizer.zero_grad()
 
-        outputs = model(inputs)
-        acc = compute_acc(vecmat2permNxN(outputs, N), perms, N * N, True)
-        loss = criterion(outputs, y_in)
+        imagenet_output, my_output = model(imagenet_images, my_images)
+        imagenet_loss = imagenet_criterion(imagenet_output, y_in)
+        my_loss = my_data_criterion(my_output, my_labels)
+        loss = imagenet_loss + my_loss  # Combine the losses from the two datasets
 
         if is_train:
             loss.backward()
             optimizer.step()
 
-        n_samples += inputs.size(0)
-        n_correct_pred += acc.item() * inputs.size(0)
-        running_loss += loss.item() * inputs.size(0)
+        # Calculate accuracy for your dataset's classification
+        _, predicted = torch.max(my_output.data, 1)
+        n_correct_pred += (predicted == my_labels).sum().item()
+        n_samples += batch_size
+
+        running_loss += loss.item() * batch_size
 
         if i % print_interval == 0 and dist.get_rank() == 0:
             elapsed_time = time.time() - start_time
@@ -393,30 +502,32 @@ def run_epoch(
                 f"Elapsed Time: {format_time(elapsed_time)}, "
                 f"Remaining Time: {format_time(remain_time)}"
             )
-            wandb.log(
-                {
-                    "running_loss": running_loss,
-                    "avg_loss": avg_loss,
-                    "avg_acc": avg_acc,
-                    "lr": optimizer.param_groups[0]["lr"],
-                }
-            )
+            # Log to wandb or any other logging tool you prefer
+            # Make sure you only log from the main process if using distributed training
+            # if dist.get_rank() == 0:
+            # wandb.log(
+            #     {
+            #         "avg_loss": avg_loss,
+            #         "avg_acc": avg_acc,
+            #         "lr": optimizer.param_groups[0]["lr"],
+            #     }
+            # )
 
     return running_loss / n_samples, n_correct_pred / n_samples, n_samples
 
 
-def test_model(model: nn.Module, test_loader: DataLoader, N: int) -> float:
-    _, n_correct_pred, n_samples = run_epoch(
-        model,
-        test_loader,
-        None,
-        None,
-        torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        N,
-        is_train=False,
-    )
-    acc = n_correct_pred / n_samples
-    return acc
+# def test_model(model: nn.Module, test_loader: DataLoader, N: int) -> float:
+#     _, n_correct_pred, n_samples = run_epoch(
+#         model,
+#         test_loader,
+#         None,
+#         None,
+#         torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+#         N,
+#         is_train=False,
+#     )
+#     acc = n_correct_pred / n_samples
+#     return acc
 
 
 if __name__ == "__main__":
@@ -425,20 +536,21 @@ if __name__ == "__main__":
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    if dist.get_rank() == 0:
-        run = wandb.init(project="Puzzle")
+    # if dist.get_rank() == 0:
+    # run = wandb.init(project="Puzzle")
 
     torch.manual_seed(42)
 
     N = 6
-    batch_size = 128
+    batch_size = 64
     dataset_dir = Path("./data/imagenet/ILSVRC/Data/CLS-LOC")
+    my_dataset_dir = Path("./data/cspuzzle")
     output_dir = Path("./outputs/jigsaw_in1k_336_56")
     n_epochs = 100
     sinkhorn_iter = 5
     weight_decay = 1e-4
 
-    transform = transforms.Compose(
+    transform1 = transforms.Compose(
         [
             transforms.Resize((336, 336)),
             transforms.RandomHorizontalFlip(),
@@ -446,35 +558,41 @@ if __name__ == "__main__":
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]
     )
+    transform2 = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]
+    )
 
     train_dataset = datasets.ImageFolder(
-        root=dataset_dir / "train", transform=transform
+        root=dataset_dir / "train", transform=transform1
     )
-    subset_indices = np.random.choice(
-        len(train_dataset), size=int(0.3 * len(train_dataset)), replace=False
+    my_train_dataset = datasets.ImageFolder(
+        root=my_dataset_dir / "train", transform=transform2
     )
-    train_dataset = Subset(train_dataset, subset_indices)
-    train_sampler = DistributedSampler(train_dataset)
-    train_loader = DataLoader(
-        train_dataset,
+    combined_train_dataset = CombinedDataset(train_dataset, my_train_dataset, N)
+    combined_train_sampler = DistributedSampler(combined_train_dataset)
+    combined_train_loader = DataLoader(
+        combined_train_dataset,
         batch_size=batch_size,
-        num_workers=10,
+        num_workers=0,
         pin_memory=True,
-        sampler=train_sampler,
+        sampler=combined_train_sampler,
     )
 
-    val_dataset = datasets.ImageFolder(root=dataset_dir / "val", transform=transform)
-    subset_indices = np.random.choice(
-        len(train_dataset), size=int(0.1 * len(train_dataset)), replace=False
+    val_dataset = datasets.ImageFolder(root=dataset_dir / "val", transform=transform1)
+    my_val_dataset = datasets.ImageFolder(
+        root=my_dataset_dir / "val", transform=transform2
     )
-    train_dataset = Subset(val_dataset, subset_indices)
-    val_sampler = DistributedSampler(val_dataset)
-    val_loader = DataLoader(
-        val_dataset,
+    combined_val_dataset = CombinedDataset(val_dataset, my_val_dataset, N)
+    combined_val_sampler = DistributedSampler(combined_val_dataset)
+    combined_val_loader = DataLoader(
+        combined_val_dataset,
         batch_size=32,
-        num_workers=10,
+        num_workers=0,
         pin_memory=True,
-        sampler=val_sampler,
+        sampler=combined_val_sampler,
     )
 
     model = JigsawNet(sinkhorn_iter=sinkhorn_iter).to(device)
@@ -486,22 +604,21 @@ if __name__ == "__main__":
     if local_rank == 0:
         print(f"# of parameters: {n_params}")
 
-    criterion = nn.BCELoss()
+    perm_criterion = nn.BCELoss().to(device)
+    my_criterion = nn.CrossEntropyLoss().to(device)
     optimizer = optim.Adam(model.parameters(), weight_decay=weight_decay)
     scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
-    checkpoint_name = dataset_dir / f"e{n_epochs}_s{sinkhorn_iter}.pk"
+    checkpoint_name = output_dir / f"e{n_epochs}_s{sinkhorn_iter}.pth"
     history = train_model(
         model,
-        criterion,
+        perm_criterion,
+        my_criterion,
         optimizer,
-        train_loader,
-        val_loader,
+        combined_train_loader,
+        combined_val_loader,
         n_epochs=n_epochs,
         checkpoint_name=checkpoint_name,
         N=N,
         scheduler=scheduler,
     )
-
-    print(f"Training accuracy: {test_model(model, train_loader, N)}")
-    print(f"Validation accuracy: {test_model(model, val_loader, N)}")
