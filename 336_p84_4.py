@@ -66,9 +66,6 @@ class CombinedDatasetMy(Dataset):
         }
 
 
-from torch.utils.data import Dataset
-
-
 class CombinedDatasetIN(Dataset):
     def __init__(self, imagenet_dataset, my_dataset, N, num_pairs=4):
         self.imagenet_dataset = imagenet_dataset
@@ -83,8 +80,8 @@ class CombinedDatasetIN(Dataset):
         imagenet_image, _ = self.imagenet_dataset[idx]
 
         # If idx is larger than the length of my_dataset, loop back to the start
-        my_idx = idx % len(self.my_dataset)
-        my_image, my_label = self.my_dataset[my_idx]
+        # my_idx = idx % len(self.my_dataset)
+        # my_image, my_label = self.my_dataset[my_idx]
 
         imagenet_image, perms = permuteNxN(
             imagenet_image, self.N, num_pairs=self.num_pairs
@@ -95,8 +92,8 @@ class CombinedDatasetIN(Dataset):
             "imagenet_image": imagenet_image,
             "y_in": y_in,
             "perms": perms,
-            "my_image": my_image,
-            "my_label": my_label,
+            # "my_image": my_image,
+            # "my_label": my_label,
         }
 
 
@@ -234,7 +231,29 @@ class JigsawNet(nn.Module):
         embeddings = embeddings.view(embeddings.size(0), -1)
         return embeddings
 
-    def forward(self, x1, x2):
+    # def forward(self, x1, x2):
+    #     # x1 is imneet images
+    #     # x2 is my images
+    #     bs, c, h, w = x1.size()
+    #     embeddings1 = self.embed(x1)
+
+    #     # Permutation prediction
+    #     x1 = F.dropout(embeddings1, p=0.1, training=self.training)
+    #     x1 = F.relu(self.fc1_bn(self.fc1(x1)))
+    #     x1 = torch.sigmoid(self.fc2(x1))
+
+    #     if self.sinkhorn_iter > 0:
+    #         x1 = x1.view(bs, self.patch_num, self.patch_num)
+    #         x1 = sinkhorn(x1, self.sinkhorn_iter)
+    #         # x1 dim: bs x patch_num x patch_num
+    #         x1 = x1.view(bs, -1)
+
+    #     # Classification
+    #     embeddings2 = self.embed(x2)
+    #     x2 = self.classifier(embeddings2)
+    #     return x1, x2
+
+    def forward(self, x1):
         # x1 is imneet images
         # x2 is my images
         bs, c, h, w = x1.size()
@@ -525,17 +544,25 @@ def run_epoch(
     start_time = time.time()
 
     for i, data in enumerate(data_loader, start=1):
-        imagenet_images, y_in, my_images, my_labels = (
+        # imagenet_images, y_in, my_images, my_labels = (
+        #     data["imagenet_image"],
+        #     data["y_in"],
+        #     data["my_image"],
+        #     data["my_label"],
+        # )
+        # imagenet_images, y_in, my_images, my_labels = (
+        #     imagenet_images.to(device),
+        #     y_in.to(device),
+        #     my_images.to(device),
+        #     my_labels.to(device),
+        # )
+        imagenet_images, y_in = (
             data["imagenet_image"],
             data["y_in"],
-            data["my_image"],
-            data["my_label"],
         )
-        imagenet_images, y_in, my_images, my_labels = (
+        imagenet_images, y_in = (
             imagenet_images.to(device),
             y_in.to(device),
-            my_images.to(device),
-            my_labels.to(device),
         )
         batch_size = imagenet_images.size(0)
 
@@ -544,7 +571,7 @@ def run_epoch(
 
         # imagenet_output, my_output = model(imagenet_images, my_images)
 
-        imagenet_output = model(imagenet_images, my_images)
+        imagenet_output = model(imagenet_images)
         imagenet_loss = imagenet_criterion(imagenet_output, y_in)
         loss = imagenet_loss
 
